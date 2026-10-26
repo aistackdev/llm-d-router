@@ -17,6 +17,8 @@ limitations under the License.
 package runner
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,6 +26,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	apixv1 "github.com/llm-d/llm-d-router/apix/v1"
+	"github.com/llm-d/llm-d-router/pkg/epp/datastore"
+	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts"
+	fcregistry "github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/registry"
+	"github.com/llm-d/llm-d-router/pkg/epp/requestcontrol"
+	runserver "github.com/llm-d/llm-d-router/pkg/epp/server"
 )
 
 type objectiveStore map[string]int32
@@ -38,24 +45,12 @@ func writeObjectivesFile(t *testing.T, content string) string {
 }
 
 func TestLoadObjectivesFile(t *testing.T) {
-	path := writeObjectivesFile(t, `apiVersion: llm-d.ai/v1
-kind: InferenceObjective
-metadata:
-  name: interactive
-spec:
-  priority: 10
----
-apiVersion: llm-d.ai/v1
-kind: InferenceObjective
-metadata:
-  name: batch
-spec:
-  priority: -1
----
-apiVersion: llm-d.ai/v1
-kind: InferenceObjective
-metadata:
-  name: unset
+	path := writeObjectivesFile(t, `objectives:
+  - name: interactive
+    priority: 10
+  - name: batch
+    priority: -1
+  - name: unset
 `)
 	store := objectiveStore{}
 	priorities, err := loadObjectivesFile(path, store)
@@ -69,17 +64,61 @@ metadata:
 }
 
 func TestLoadObjectivesFileErrors(t *testing.T) {
-	for name, content := range map[string]string{
-		"wrong kind":       "apiVersion: llm-d.ai/v1\nkind: InferencePool\nmetadata:\n  name: p\n",
-		"wrong version":    "apiVersion: llm-d.ai/v1alpha2\nkind: InferenceObjective\nmetadata:\n  name: o\n",
-		"missing name":     "apiVersion: llm-d.ai/v1\nkind: InferenceObjective\nspec:\n  priority: 1\n",
-		"invalid priority": "apiVersion: llm-d.ai/v1\nkind: InferenceObjective\nmetadata:\n  name: o\nspec:\n  priority: high\n",
+	for name, tc := range map[string]struct{ content, err string }{
+		"missing name":     {"objectives:\n  - priority: 1\n", "objective 0: name is required"},
+		"duplicate name":   {"objectives:\n  - name: o\n  - name: o\n    priority: 1\n", `objective 1: duplicate name "o"`},
+		"unknown field":    {"objectives:\n  - name: o\n    weight: 1\n", "unknown field"},
+		"invalid priority": {"objectives:\n  - name: o\n    priority: high\n", "cannot unmarshal string"},
+		"manifest":         {"apiVersion: llm-d.ai/v1\nkind: InferenceObjective\nmetadata:\n  name: o\n", "unknown field"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := loadObjectivesFile(writeObjectivesFile(t, content), objectiveStore{})
-			require.ErrorContains(t, err, "document 1")
+			_, err := loadObjectivesFile(writeObjectivesFile(t, tc.content), objectiveStore{})
+			require.ErrorContains(t, err, tc.err)
 		})
 	}
 	_, err := loadObjectivesFile(filepath.Join(t.TempDir(), "missing.yaml"), objectiveStore{})
-	require.Error(t, err)
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+// TestObjectivesFileWiring follows the file-discovery startup path: objectives are
+// loaded into the datastore, and with the flowControl gate their bands exist as
+// soon as provisionObjectiveBands returns, before any request can arrive.
+func TestObjectivesFileWiring(t *testing.T) {
+	path := writeObjectivesFile(t, "objectives:\n  - name: interactive\n    priority: 10\n  - name: batch\n    priority: -1\n")
+	for _, gate := range []string{"flowControl", "flowControl=false"} {
+		t.Run(gate, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			opts := runserver.NewOptions()
+			opts.ConfigText = fmt.Sprintf("apiVersion: llm-d.ai/v1\nkind: EndpointPickerConfig\nfeatureGates:\n- %s\n", gate)
+			opts.PoolName = testPoolName
+
+			r := NewRunner()
+			r.servingCtx, r.cancelServing = context.WithCancel(context.WithoutCancel(ctx))
+			t.Cleanup(r.stopServing)
+			rawConfig, err := r.parseConfigurationPhaseOne(ctx, opts)
+			require.NoError(t, err)
+
+			ds := datastore.NewDatastore(ctx, r.setupMetricsCollection(opts))
+			priorities, err := loadObjectivesFile(path, ds)
+			require.NoError(t, err)
+			require.Equal(t, int32(10), *ds.ObjectiveGet("interactive").Spec.Priority)
+			require.Equal(t, int32(-1), *ds.ObjectiveGet("batch").Spec.Priority)
+
+			eppConfig, err := r.parseConfigurationPhaseTwo(ctx, rawConfig, ds, opts.RefreshMetricsInterval)
+			require.NoError(t, err)
+			_, _, controlPlane, _ := r.initAdmissionControl(r.servingCtx, opts, eppConfig,
+				contracts.EndpointCandidates(requestcontrol.NewDatastoreEndpointCandidates(ds)))
+			provisionObjectiveBands(controlPlane, priorities)
+
+			if gate == "flowControl=false" {
+				require.Nil(t, controlPlane)
+				return
+			}
+			registry, ok := controlPlane.(*fcregistry.FlowRegistry)
+			require.True(t, ok)
+			require.Subset(t, registry.AllOrderedPriorityLevels(), []int{10, -1})
+		})
+	}
 }

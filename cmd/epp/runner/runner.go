@@ -1288,18 +1288,14 @@ func (r *Runner) runWithFileDiscovery(ctx context.Context, opts *runserver.Optio
 
 	scheduler := scheduling.NewSchedulerWithConfig(r.schedulerConfig)
 
-	// Outside Kubernetes there is no InferenceObjective CRD, so per-request
-	// priority falls back to Director.defaultPriority (see
-	// pkg/epp/requestcontrol/director.go); static bands defined in
-	// EndpointPickerConfig.flowControl still apply.
+	// Per-request priority comes from --objectives-file; a request whose
+	// objective is not loaded gets Director.defaultPriority.
 	endpointCandidates := contracts.EndpointCandidates(requestcontrol.NewDatastoreEndpointCandidates(ds,
 		requestcontrol.WithDisableEndpointSubsetFilter(opts.DisableEndpointSubsetFilter)))
 	// Static bands from config apply at registry construction; --objectives-file
-	// priorities are submitted here, as the InferenceObjective reconciler does.
+	// bands are provisioned here, before the server starts serving.
 	endpointCandidates, admissionController, bandControlPlane, requestEvictor := r.initAdmissionControl(r.servingCtx, opts, eppConfig, endpointCandidates)
-	if bandControlPlane != nil && len(objectivePriorities) > 0 {
-		bandControlPlane.SubmitDesiredPriorities(objectivePriorities)
-	}
+	provisionObjectiveBands(bandControlPlane, objectivePriorities)
 	director := requestcontrol.NewDirectorWithConfig(ds, scheduler, admissionController, endpointCandidates, r.requestControlConfig)
 	if requestEvictor != nil {
 		director.SetRequestEvictor(requestEvictor)
